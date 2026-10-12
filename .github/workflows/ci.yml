@@ -1,0 +1,27 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y mold clang
+      - uses: Swatinem/rust-cache@v2
+      - run: >-
+          docker run -d --name fila-redis -p 56380:6379 redis:7-alpine
+          redis-server --appendonly yes --appendfsync always --maxmemory-policy noeviction
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: timeout 300 cargo test
+      - run: timeout 180 cargo test --test fila -- --ignored redis_killed
+        env:
+          FILA_TEST_REDIS_CONTAINER: fila-redis

@@ -1,0 +1,6 @@
+# Redis para las pruebas, con la durabilidad que se exige en producción.
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["56380:6379"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
