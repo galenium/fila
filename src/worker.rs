@@ -154,9 +154,17 @@ pub async fn run_worker<H: Handler>(
     outcome.and(drained)
 }
 
-fn take_fault(n: &AtomicU32) -> bool {
-    n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
-        .is_ok()
+/// Resta uno si queda alguno. (`fetch_update` está obsoleto en Rust reciente y `try_update` no existe
+/// en el estable que usamos: un `compare_exchange` sirve en ambos.)
+pub(crate) fn take_one(n: &AtomicU32) -> bool {
+    let mut v = n.load(Ordering::SeqCst);
+    while v > 0 {
+        match n.compare_exchange(v, v - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => v = now,
+        }
+    }
+    false
 }
 
 async fn process<H: Handler>(
@@ -199,7 +207,7 @@ async fn process<H: Handler>(
         tokio::select! {
             r = &mut work => break r,
             _ = renew.tick(), if renewing => {
-                let r = if take_fault(&cfg.faults.fail_extend) {
+                let r = if take_one(&cfg.faults.fail_extend) {
                     Err(Error::Injected)
                 } else {
                     fila.extend(&t, cfg.lease).await

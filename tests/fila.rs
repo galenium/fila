@@ -366,6 +366,17 @@ async fn a_long_handler_keeps_its_turn() {
     stop(ws).await;
 }
 
+fn take_one(n: &AtomicU32) -> bool {
+    let mut v = n.load(Ordering::SeqCst);
+    while v > 0 {
+        match n.compare_exchange(v, v - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => v = now,
+        }
+    }
+    false
+}
+
 fn docker(args: &[&str]) -> bool {
     std::process::Command::new("timeout")
         .arg("20")
@@ -664,12 +675,7 @@ struct Panicky {
 impl Handler for Panicky {
     async fn handle(&self, job: Job) -> Result<(), HandlerError> {
         let n = u32::from_be_bytes(job.payload.as_slice().try_into().unwrap());
-        if n == 0
-            && self
-                .panics_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
-                .is_ok()
-        {
+        if n == 0 && take_one(&self.panics_left) {
             panic!("manejador roto a propósito");
         }
         self.log.lock().unwrap().push(n);
@@ -812,11 +818,7 @@ struct Timed {
 impl Handler for Timed {
     async fn handle(&self, _job: Job) -> Result<(), HandlerError> {
         self.at.lock().unwrap().push(std::time::Instant::now());
-        if self
-            .fails_left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
-            .is_ok()
-        {
+        if take_one(&self.fails_left) {
             return Err(HandlerError::Retry("todavía no".into()));
         }
         Ok(())
