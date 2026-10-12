@@ -11,6 +11,8 @@ name = "galenium_fila"
 [dependencies]
 redis = { version = "1.7.1", default-features = false, features = ["tokio-comp", "script"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
 uuid = { version = "1.28.0", features = ["v7"] }
 
 [lints.rust]

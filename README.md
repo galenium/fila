@@ -39,26 +39,59 @@ Lua, que Redis ejecuta sin interrupciones, así que dos trabajadores nunca toman
 ## Uso
 
 ```rust
-let fila = Fila::open(&redis, "", "records").await?; // exige Redis durable
+let fila = Fila::open(&redis, "", "records").await?; // exige Redis durable; OnDead::Halt
 fila.push("tenant:42", event_id, &payload).await?;
 
 run_worker(fila, handler, WorkerConfig::default(), stop).await?;
 ```
 
 El `id` lo da el productor: si reintenta un `push` que falló a medias, el duplicado lleva el mismo `id`.
-El manejador puede ejecutarse más de una vez para un mismo `id`: sus efectos deben ser idempotentes.
+
+## Contrato del manejador
+
+`Handler::handle` recibe un `Job` con `group`, `id`, `payload`, `attempt`, `fence` y `lost`:
+
+- **Al menos una vez**: puede ejecutarse más de una vez para un mismo `id`. Los efectos deben ser
+  idempotentes por `id`.
+- **`fence`** crece con cada turno de la cola. Un trabajador puede perder su turno (una pausa larga, la
+  red) y seguir corriendo mientras otro procesa el mensaje siguiente. Para que su escritura tardía no
+  caiga fuera de orden, el destino guarda el último `fence` aplicado por grupo y rechaza los menores
+  (en Postgres: `UPDATE ... WHERE fence < $nuevo`, en la misma transacción).
+- **`lost`** se activa cuando el trabajador sabe que perdió el turno: el manejador debería parar.
+- Un **pánico** del manejador cuenta como un intento fallido: el trabajador sigue vivo.
+
+## Mensajes muertos
+
+`Options::on_dead` decide qué pasa con el grupo cuando un mensaje acaba en la DLQ:
+
+- `Halt` (por defecto): el grupo se detiene, aunque su fila quede vacía. El mensaje siguiente no se
+  aplica sin el que murió. Lo correcto para permisos o transiciones de estado.
+- `Continue`: el grupo sigue. Para mensajes independientes, como notificaciones.
+
+Para reactivar un grupo detenido: `redrive(id_en_dlq)` devuelve el mensaje muerto **al frente** de su
+fila (conserva el orden); `release(grupo)` sigue sin él. `halted()` lista los grupos detenidos.
+
+## Trabajador
 
 `WorkerConfig::default()`: 32 grupos a la vez, turnos de 30 s renovados cada tercio, reintentos a los
-`1 s, 10 s, 30 s, 1 min, 5 min, 15 min, 1 h` y después a la DLQ. Ante un fallo de Redis, el trabajador deja
-de tomar mensajes, espera a los manejadores en vuelo y devuelve el error: el servicio lo reinicia.
+`1 s, 10 s, 30 s, 1 min, 5 min, 15 min, 1 h` y después a la DLQ.
+
+- Un fallo pasajero al renovar no suelta el turno: se reintenta en el siguiente tercio.
+- Ante un fallo de Redis, deja de tomar mensajes, espera a los manejadores en vuelo y devuelve el error:
+  el servicio lo reinicia.
+- Cada confirmación rechazada (turno perdido), renovación fallida o pánico deja un aviso con `tracing`.
 
 ## Requisitos de Redis
 
 `Fila::open` se niega a abrir si Redis no tiene `appendonly yes`, `appendfsync always` y
-`maxmemory-policy noeviction`: confirmado un `push`, Redis es la única copia del mensaje.
+`maxmemory-policy noeviction`: confirmado un `push`, Redis es la única copia del mensaje. Los Redis
+gestionados que bloquean `CONFIG` obligan a usar `Options { verify_durability: false, .. }`; entonces esa
+durabilidad queda a cargo de quien lo despliega.
 
 Con Redis Cluster, todas las claves de una cola caen en el mismo nodo (`{cola}`): una cola no se reparte
 entre nodos.
+
+La DLQ no se recorta sola (recortarla perdería mensajes): hay que vigilar su tamaño.
 
 ## Pruebas
 
@@ -67,6 +100,8 @@ docker compose up -d   # Redis durable en 56380
 cargo test
 cargo test --test fila -- --ignored redis_killed   # mata Redis con SIGKILL en plena carga
 ```
+
+El repo enlaza con `clang` y `mold` (`.cargo/config.toml`, estándar de la org): hay que tenerlos instalados.
 
 Se verificaron con mutaciones (turno al frente en vez de al final, `take` sin sacar el grupo, `push` que
 mete en turnos un grupo ocupado, `ack` sin token, `maintain` sin recuperar turnos, intentos sin contar,

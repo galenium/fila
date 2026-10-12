@@ -15,7 +15,7 @@ use redis::Script;
 use redis::aio::MultiplexedConnection;
 use uuid::Uuid;
 
-pub use worker::{Handler, HandlerError, WorkerConfig, run_worker};
+pub use worker::{Faults, Handler, HandlerError, Job, WorkerConfig, run_worker};
 
 #[derive(Debug)]
 pub enum Error {
@@ -23,6 +23,11 @@ pub enum Error {
     Config(&'static str),
     /// Un mensaje en Redis sin el formato que escribe `push`.
     BadMessage,
+    /// Una tarea interna del trabajador entró en pánico (los pánicos de los manejadores no llegan aquí:
+    /// cuentan como un intento fallido).
+    Panic(String),
+    /// Fallo provocado por `Faults`, solo en pruebas.
+    Injected,
 }
 
 impl std::fmt::Display for Error {
@@ -31,6 +36,8 @@ impl std::fmt::Display for Error {
             Self::Redis(e) => write!(f, "redis: {e}"),
             Self::Config(m) => write!(f, "configuración inválida: {m}"),
             Self::BadMessage => write!(f, "mensaje con formato inválido"),
+            Self::Panic(m) => write!(f, "pánico en el trabajador: {m}"),
+            Self::Injected => write!(f, "fallo inyectado"),
         }
     }
 }
@@ -43,6 +50,33 @@ impl From<redis::RedisError> for Error {
     }
 }
 
+/// Qué hacer con el grupo cuando un mensaje acaba en la DLQ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnDead {
+    /// El grupo queda detenido hasta `redrive` o `release`: el mensaje siguiente no se aplica sin el
+    /// que murió. Lo correcto cuando un mensaje depende del anterior (permisos, estados).
+    Halt,
+    /// El grupo sigue con el mensaje siguiente. Para mensajes independientes (notificaciones).
+    Continue,
+}
+
+pub struct Options {
+    /// Comprobar al abrir que Redis no responde antes de escribir a disco ni expulsa claves. Los Redis
+    /// gestionados que bloquean `CONFIG` obligan a desactivarlo: entonces la durabilidad queda a cargo
+    /// de quien lo despliega.
+    pub verify_durability: bool,
+    pub on_dead: OnDead,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            verify_durability: true,
+            on_dead: OnDead::Halt,
+        }
+    }
+}
+
 static PUSH: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("lua/push.lua")));
 static TAKE: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("lua/take.lua")));
 static ACK: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("lua/ack.lua")));
@@ -50,6 +84,8 @@ static RETRY: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("lua/
 static BURY: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("lua/bury.lua")));
 static EXTEND: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("lua/extend.lua")));
 static MAINTAIN: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("lua/maintain.lua")));
+static REDRIVE: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("lua/redrive.lua")));
+static RELEASE: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("lua/release.lua")));
 
 /// Un mensaje en proceso. Su `token` identifica el turno: si el turno venció y otro trabajador tomó el
 /// grupo, este token deja de valer y sus confirmaciones se rechazan.
@@ -60,6 +96,9 @@ pub struct Taken {
     pub payload: Vec<u8>,
     /// Empieza en 1. Cuenta también los intentos de procesos que murieron con el mensaje en la mano.
     pub attempt: u32,
+    /// Crece con cada turno de la cola. Un destino que guarde el último visto por grupo y rechace los
+    /// menores queda a salvo de un trabajador que perdió su turno y escribe tarde.
+    pub fence: u64,
     token: String,
 }
 
@@ -70,21 +109,35 @@ pub struct Fila {
     /// Todas las claves de la cola llevan `{cola}`: en Redis Cluster caen en el mismo nodo, y los scripts
     /// pueden tocarlas juntas.
     base: String,
+    halt_on_dead: bool,
 }
 
 impl Fila {
-    /// Abre la cola `queue`. Se niega si Redis no escribe a disco antes de responder o puede expulsar claves.
+    /// Abre la cola `queue` con las opciones por defecto (verifica durabilidad; detiene el grupo de un
+    /// mensaje muerto).
     pub async fn open(client: &redis::Client, prefix: &str, queue: &str) -> Result<Self, Error> {
+        Self::open_with(client, prefix, queue, Options::default()).await
+    }
+
+    pub async fn open_with(
+        client: &redis::Client,
+        prefix: &str,
+        queue: &str,
+        opts: Options,
+    ) -> Result<Self, Error> {
         let cfg = redis::AsyncConnectionConfig::new()
             .set_connection_timeout(Some(Duration::from_secs(5)))
             .set_response_timeout(Some(Duration::from_secs(10)));
         let mut conn = client
             .get_multiplexed_async_connection_with_config(&cfg)
             .await?;
-        check_durable(&mut conn).await?;
+        if opts.verify_durability {
+            check_durable(&mut conn).await?;
+        }
         Ok(Self {
             conn,
             base: format!("{prefix}{{{queue}}}"),
+            halt_on_dead: opts.on_dead == OnDead::Halt,
         })
     }
 
@@ -109,6 +162,7 @@ impl Fila {
         PUSH.key(self.key("ready"))
             .key(self.key("busy"))
             .key(self.key("delay"))
+            .key(self.key("halted"))
             .key(self.group_key(group))
             .arg(group)
             .arg(msg)
@@ -120,17 +174,18 @@ impl Fila {
     /// Toma el turno del siguiente grupo con trabajo, durante `lease`. `None` si no hay ninguno libre.
     pub async fn take(&self, lease: Duration) -> Result<Option<Taken>, Error> {
         let token = Uuid::now_v7().to_string();
-        let r: Option<(String, Vec<u8>, u32)> = TAKE
+        let r: Option<(String, Vec<u8>, u32, u64)> = TAKE
             .key(self.key("ready"))
             .key(self.key("busy"))
             .key(self.key("tok"))
             .key(self.key("att"))
+            .key(self.key("fence"))
             .arg(lease.as_millis() as u64)
             .arg(&token)
             .arg(self.group_prefix())
             .invoke_async(&mut self.conn.clone())
             .await?;
-        let Some((group, msg, attempt)) = r else {
+        let Some((group, msg, attempt, fence)) = r else {
             return Ok(None);
         };
         if msg.len() < 16 {
@@ -142,6 +197,7 @@ impl Fila {
             id,
             payload: msg[16..].to_vec(),
             attempt,
+            fence,
             token,
         }))
     }
@@ -175,7 +231,7 @@ impl Fila {
         Ok(n == 1)
     }
 
-    /// Mueve el mensaje a la DLQ (el stream `dead`) y el grupo sigue con el siguiente.
+    /// Mueve el mensaje a la DLQ (el stream `dead`). Según `Options::on_dead`, el grupo se detiene o sigue.
     pub async fn bury(&self, t: &Taken, error: &str) -> Result<bool, Error> {
         let n: i64 = BURY
             .key(self.key("busy"))
@@ -184,9 +240,11 @@ impl Fila {
             .key(self.key("att"))
             .key(self.group_key(&t.group))
             .key(self.key("dead"))
+            .key(self.key("halted"))
             .arg(&t.group)
             .arg(&t.token)
             .arg(error)
+            .arg(if self.halt_on_dead { "1" } else { "0" })
             .invoke_async(&mut self.conn.clone())
             .await?;
         Ok(n == 1)
@@ -215,6 +273,41 @@ impl Fila {
             .key(self.key("delay"))
             .arg(limit)
             .invoke_async(&mut self.conn.clone())
+            .await?)
+    }
+
+    /// Devuelve la entrada `dead_id` de la DLQ al frente de su fila y reactiva el grupo. `false` si no existe.
+    pub async fn redrive(&self, dead_id: &str) -> Result<bool, Error> {
+        let n: i64 = REDRIVE
+            .key(self.key("ready"))
+            .key(self.key("busy"))
+            .key(self.key("delay"))
+            .key(self.key("halted"))
+            .key(self.key("dead"))
+            .arg(dead_id)
+            .arg(self.group_prefix())
+            .invoke_async(&mut self.conn.clone())
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// Reactiva un grupo detenido sin su mensaje muerto. `false` si no estaba detenido.
+    pub async fn release(&self, group: &str) -> Result<bool, Error> {
+        let n: i64 = RELEASE
+            .key(self.key("ready"))
+            .key(self.key("halted"))
+            .key(self.group_key(group))
+            .arg(group)
+            .invoke_async(&mut self.conn.clone())
+            .await?;
+        Ok(n == 1)
+    }
+
+    /// Grupos detenidos por un mensaje muerto.
+    pub async fn halted(&self) -> Result<Vec<String>, Error> {
+        Ok(redis::cmd("SMEMBERS")
+            .arg(self.key("halted"))
+            .query_async(&mut self.conn.clone())
             .await?)
     }
 

@@ -1,8 +1,11 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{Error, Fila, Taken};
@@ -10,20 +13,34 @@ use crate::{Error, Fila, Taken};
 pub enum HandlerError {
     /// Fallo pasajero: el grupo espera según `retry_delays` y se reintenta el mismo mensaje.
     Retry(String),
-    /// Fallo permanente: el mensaje va a la DLQ y el grupo sigue.
+    /// Fallo permanente: el mensaje va a la DLQ (y el grupo se detiene o sigue según `Options::on_dead`).
     Fatal(String),
 }
 
+/// Lo que recibe un manejador.
+pub struct Job {
+    pub group: String,
+    pub id: Uuid,
+    pub payload: Vec<u8>,
+    pub attempt: u32,
+    /// Número de turno, creciente en toda la cola. El destino guarda el último aplicado por grupo y
+    /// rechaza escrituras con uno menor: así un manejador que perdió su turno no escribe fuera de orden.
+    pub fence: u64,
+    /// Se activa si el turno se pierde: otro trabajador ya tiene el grupo. El manejador debería parar.
+    pub lost: CancellationToken,
+}
+
 pub trait Handler: Send + Sync + 'static {
-    /// Puede ejecutarse más de una vez para el mismo `id` (si el proceso muere tras el efecto y antes
-    /// de confirmar): los efectos deben ser idempotentes por `id`.
-    fn handle(
-        &self,
-        group: &str,
-        id: Uuid,
-        payload: &[u8],
-        attempt: u32,
-    ) -> impl Future<Output = Result<(), HandlerError>> + Send;
+    /// Puede ejecutarse más de una vez para el mismo `id` (si el proceso muere tras el efecto y antes de
+    /// confirmar): los efectos deben ser idempotentes por `id` y protegidos por `fence`.
+    fn handle(&self, job: Job) -> impl Future<Output = Result<(), HandlerError>> + Send;
+}
+
+/// Fallos inyectables para las pruebas. En producción no se tocan.
+#[derive(Clone, Default)]
+pub struct Faults {
+    /// Las próximas N renovaciones de turno fallan como si Redis no respondiera.
+    pub fail_extend: Arc<AtomicU32>,
 }
 
 pub struct WorkerConfig {
@@ -36,6 +53,7 @@ pub struct WorkerConfig {
     pub maintain_every: Duration,
     /// Espera antes de cada reintento; agotada la lista, el mensaje va a la DLQ.
     pub retry_delays: Vec<Duration>,
+    pub faults: Faults,
 }
 
 impl Default for WorkerConfig {
@@ -47,6 +65,7 @@ impl Default for WorkerConfig {
             poll: Duration::from_millis(50),
             maintain_every: Duration::from_millis(500),
             retry_delays: vec![s(1), s(10), s(30), s(60), s(300), s(900), s(3600)],
+            faults: Faults::default(),
         }
     }
 }
@@ -58,9 +77,24 @@ async fn sleep_or_stop(stop: &mut watch::Receiver<bool>, d: Duration) {
     }
 }
 
+fn panic_text(e: JoinError) -> String {
+    match e.try_into_panic() {
+        Ok(p) => p
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "sin mensaje".into()),
+        Err(_) => "tarea cancelada".into(),
+    }
+}
+
+fn joined(r: Result<Result<(), Error>, JoinError>) -> Result<(), Error> {
+    r.map_err(|e| Error::Panic(panic_text(e)))?
+}
+
 fn reap(inflight: &mut JoinSet<Result<(), Error>>) -> Result<(), Error> {
     while let Some(r) = inflight.try_join_next() {
-        r.map_err(|_| Error::Config("una tarea del trabajador entró en pánico"))??;
+        joined(r)?;
     }
     Ok(())
 }
@@ -112,9 +146,7 @@ pub async fn run_worker<H: Handler>(
     // y si su confirmación falla, el mensaje solo se vuelve a entregar.
     let mut drained = Ok(());
     while let Some(r) = inflight.join_next().await {
-        let r = r
-            .map_err(|_| Error::Config("una tarea del trabajador entró en pánico"))
-            .and_then(|r| r);
+        let r = joined(r);
         if drained.is_ok() {
             drained = r;
         }
@@ -122,51 +154,86 @@ pub async fn run_worker<H: Handler>(
     outcome.and(drained)
 }
 
+fn take_fault(n: &AtomicU32) -> bool {
+    n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+        .is_ok()
+}
+
 async fn process<H: Handler>(
     ctx: Arc<(Fila, H, WorkerConfig)>,
     t: Taken,
     _permit: OwnedSemaphorePermit,
 ) -> Result<(), Error> {
-    let (fila, handler, cfg) = &*ctx;
+    let (fila, _, cfg) = &*ctx;
     let max_attempts = cfg.retry_delays.len() as u32 + 1;
     // Más intentos que los previstos solo ocurre si el proceso murió con este mensaje en la mano una y
     // otra vez: probablemente es él quien lo tumba.
     if t.attempt > max_attempts {
-        fila.bury(&t, "superó los intentos sin terminar (¿tumba al proceso?)")
-            .await?;
+        if !fila
+            .bury(&t, "superó los intentos sin terminar (¿tumba al proceso?)")
+            .await?
+        {
+            warn!(group = t.group, id = %t.id, "turno perdido al enterrar: otro trabajador tiene el grupo");
+        }
         return Ok(());
     }
 
-    let work = handler.handle(&t.group, t.id, &t.payload, t.attempt);
-    tokio::pin!(work);
+    let lost = CancellationToken::new();
+    let job = Job {
+        group: t.group.clone(),
+        id: t.id,
+        payload: t.payload.clone(),
+        attempt: t.attempt,
+        fence: t.fence,
+        lost: lost.clone(),
+    };
+    // En su propia tarea: un pánico del manejador cuenta como un intento fallido, no tumba al trabajador.
+    let mut work = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { ctx.1.handle(job).await }
+    });
     let mut renew = tokio::time::interval(cfg.lease / 3);
     renew.tick().await;
     let mut renewing = true;
-    let result = loop {
+    let joined = loop {
         tokio::select! {
             r = &mut work => break r,
             _ = renew.tick(), if renewing => {
-                // Si el turno se perdió (o Redis no responde), el manejador termina igualmente: su
-                // confirmación se rechazará y el mensaje se procesará de nuevo (al menos una vez).
-                renewing = matches!(fila.extend(&t, cfg.lease).await, Ok(true));
+                let r = if take_fault(&cfg.faults.fail_extend) {
+                    Err(Error::Injected)
+                } else {
+                    fila.extend(&t, cfg.lease).await
+                };
+                match r {
+                    Ok(true) => {}
+                    // Perdido de verdad: otro trabajador tiene el grupo.
+                    Ok(false) => {
+                        renewing = false;
+                        lost.cancel();
+                        warn!(group = t.group, id = %t.id, "turno perdido durante el manejador");
+                    }
+                    // Pasajero: se insiste en el siguiente tick.
+                    Err(e) => warn!(group = t.group, id = %t.id, error = %e, "no se pudo renovar el turno"),
+                }
             }
         }
     };
-    match result {
-        Ok(()) => {
-            fila.ack(&t).await?;
-        }
+    let result = joined.unwrap_or_else(|e| {
+        let m = panic_text(e);
+        warn!(group = t.group, id = %t.id, panic = m, "el manejador entró en pánico");
+        Err(HandlerError::Retry(format!("pánico: {m}")))
+    });
+
+    let (confirmed, what) = match result {
+        Ok(()) => (fila.ack(&t).await?, "confirmar"),
         Err(HandlerError::Retry(m)) => match cfg.retry_delays.get(t.attempt as usize - 1) {
-            Some(&after) => {
-                fila.retry(&t, after).await?;
-            }
-            None => {
-                fila.bury(&t, &m).await?;
-            }
+            Some(&after) => (fila.retry(&t, after).await?, "reintentar"),
+            None => (fila.bury(&t, &m).await?, "enterrar"),
         },
-        Err(HandlerError::Fatal(m)) => {
-            fila.bury(&t, &m).await?;
-        }
+        Err(HandlerError::Fatal(m)) => (fila.bury(&t, &m).await?, "enterrar"),
+    };
+    if !confirmed {
+        warn!(group = t.group, id = %t.id, accion = what, "turno perdido: el mensaje se procesará de nuevo");
     }
     Ok(())
 }

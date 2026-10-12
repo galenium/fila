@@ -16,10 +16,21 @@ fn client() -> redis::Client {
 }
 
 async fn fila() -> Fila {
+    fila_with(Options::default()).await
+}
+
+async fn fila_with(opts: Options) -> Fila {
     let prefix = format!("t{}:", Uuid::now_v7().simple());
-    Fila::open(&client(), &prefix, "q")
+    Fila::open_with(&client(), &prefix, "q", opts)
         .await
         .expect("Redis no disponible o no durable: ejecuta `docker compose up -d`")
+}
+
+fn continue_on_dead() -> Options {
+    Options {
+        on_dead: OnDead::Continue,
+        ..Options::default()
+    }
 }
 
 fn ms(n: u64) -> Duration {
@@ -48,16 +59,13 @@ struct Rec {
     /// Pausa por (grupo, n).
     slow: Arc<Mutex<HashMap<(String, u32), Duration>>>,
     calls: Arc<AtomicU32>,
+    /// (grupo, n, cuántos mensajes de OTROS grupos deben estar procesados antes de que este salga bien).
+    gate: Arc<Mutex<Option<(String, u32, usize)>>>,
 }
 
 impl Handler for Rec {
-    async fn handle(
-        &self,
-        group: &str,
-        id: Uuid,
-        payload: &[u8],
-        _attempt: u32,
-    ) -> Result<(), HandlerError> {
+    async fn handle(&self, job: Job) -> Result<(), HandlerError> {
+        let (group, id, payload) = (job.group.as_str(), job.id, job.payload.as_slice());
         self.calls.fetch_add(1, Ordering::SeqCst);
         let n = u32::from_be_bytes(payload.try_into().unwrap());
         if !self.busy.lock().unwrap().insert(group.to_string()) {
@@ -75,7 +83,26 @@ impl Handler for Rec {
         )
         .await;
         let key = (group.to_string(), n);
-        let result = if self.fatal.lock().unwrap().contains(&key) {
+        let gated = self
+            .gate
+            .lock()
+            .unwrap()
+            .clone()
+            .is_some_and(|(g, gn, need)| {
+                g == group
+                    && gn == n
+                    && self
+                        .log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(x, ..)| x != group)
+                        .count()
+                        < need
+            });
+        let result = if gated {
+            Err(HandlerError::Retry("esperando a los demás".into()))
+        } else if self.fatal.lock().unwrap().contains(&key) {
             Err(HandlerError::Fatal("veneno".into()))
         } else if let Some(left) = self.retry.lock().unwrap().get_mut(&key)
             && *left > 0
@@ -120,6 +147,7 @@ fn cfg(concurrency: usize, delays_ms: &[u64]) -> WorkerConfig {
         poll: ms(5),
         maintain_every: ms(20),
         retry_delays: delays_ms.iter().map(|&d| ms(d)).collect(),
+        faults: Faults::default(),
     }
 }
 
@@ -144,7 +172,7 @@ async fn wait_until(what: &str, secs: u64, f: impl Fn() -> bool) {
     panic!("tiempo agotado esperando: {what}");
 }
 
-async fn dead(f: &Fila) -> Vec<HashMap<String, String>> {
+async fn dead_entries(f: &Fila) -> Vec<(String, HashMap<String, String>)> {
     let mut c = client().get_multiplexed_async_connection().await.unwrap();
     type Entries = Vec<(String, Vec<(String, Vec<u8>)>)>;
     let r: Entries = redis::cmd("XRANGE")
@@ -155,12 +183,19 @@ async fn dead(f: &Fila) -> Vec<HashMap<String, String>> {
         .await
         .unwrap();
     r.into_iter()
-        .map(|(_, kv)| {
-            kv.into_iter()
-                .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
-                .collect()
+        .map(|(id, kv)| {
+            (
+                id,
+                kv.into_iter()
+                    .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
+                    .collect(),
+            )
         })
         .collect()
+}
+
+async fn dead(f: &Fila) -> Vec<HashMap<String, String>> {
+    dead_entries(f).await.into_iter().map(|(_, m)| m).collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -189,29 +224,22 @@ async fn order_per_group_with_many_workers_and_never_two_on_one_group() {
 async fn a_failing_group_only_blocks_itself() {
     let f = fila().await;
     let h = Rec::default();
-    h.retry.lock().unwrap().insert(("malo".into(), 0), 2);
+    // `malo` falla mientras los demás no hayan terminado: si los bloqueara, nunca terminarían.
+    *h.gate.lock().unwrap() = Some(("malo".into(), 0, 50));
     push_n(&f, "malo", 5).await;
     for i in 0..5 {
         push_n(&f, &format!("bueno{i}"), 10).await;
     }
-    let ws = vec![worker(&f, h.clone(), cfg(4, &[500, 500]))];
-    wait_until("todo procesado", 10, || h.len() == 55).await;
-
+    let ws = vec![worker(&f, h.clone(), cfg(4, &[50; 100]))];
+    wait_until("todo procesado", 15, || h.len() == 55).await;
     assert_eq!(
         h.seqs("malo"),
         [0, 1, 2, 3, 4],
         "el grupo que falla conserva su orden"
     );
-    let log = h.log.lock().unwrap().clone();
-    let first_malo = log.iter().position(|(g, ..)| g == "malo").unwrap();
-    let last_bueno = log
-        .iter()
-        .rposition(|(g, ..)| g.starts_with("bueno"))
-        .unwrap();
-    assert!(
-        last_bueno < first_malo,
-        "los demás grupos terminaron mientras `malo` esperaba sus reintentos"
-    );
+    for i in 0..5 {
+        assert_eq!(h.seqs(&format!("bueno{i}")), (0..10).collect::<Vec<_>>());
+    }
     stop(ws).await;
 }
 
@@ -252,7 +280,7 @@ async fn an_abandoned_turn_is_resumed_and_a_stale_ack_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn poison_goes_to_dead_and_the_group_continues() {
-    let f = fila().await;
+    let f = fila_with(continue_on_dead()).await;
     let h = Rec::default();
     h.retry.lock().unwrap().insert(("a".into(), 1), 1000);
     h.fatal.lock().unwrap().insert(("a".into(), 2));
@@ -275,7 +303,7 @@ async fn poison_goes_to_dead_and_the_group_continues() {
 
 #[tokio::test]
 async fn a_message_that_keeps_killing_the_process_is_buried_without_running_again() {
-    let f = fila().await;
+    let f = fila_with(continue_on_dead()).await;
     push_n(&f, "a", 2).await;
     // Tres "muertes" con el mensaje en la mano: se toma y se deja vencer el turno.
     for _ in 0..3 {
@@ -319,12 +347,12 @@ async fn a_group_with_much_work_does_not_starve_the_others() {
 async fn a_long_handler_keeps_its_turn() {
     let f = fila().await;
     let h = Rec::default();
-    h.slow.lock().unwrap().insert(("a".into(), 0), ms(1000));
+    h.slow.lock().unwrap().insert(("a".into(), 0), ms(2500));
     push_n(&f, "a", 2).await;
     let mut c = cfg(2, &[]);
-    c.lease = ms(300); // el manejador dura más de tres turnos: debe renovarlo
+    c.lease = ms(800); // el manejador dura más de tres turnos: debe renovarlo
     let mut c2 = cfg(2, &[]);
-    c2.lease = ms(300);
+    c2.lease = ms(800);
     let ws = vec![worker(&f, h.clone(), c), worker(&f, h.clone(), c2)];
     wait_until("ambos procesados", 10, || h.len() == 2).await;
     tokio::time::sleep(ms(500)).await;
@@ -474,4 +502,347 @@ async fn redis_killed_mid_flight_loses_nothing_and_keeps_order() {
             .expect("un trabajador no paró")
             .unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transient_renewal_failure_does_not_lose_the_turn() {
+    let f = fila().await;
+    let h = Rec::default();
+    h.slow.lock().unwrap().insert(("a".into(), 0), ms(1800));
+    push_n(&f, "a", 2).await;
+    let mut a = cfg(2, &[]);
+    a.lease = ms(600); // renueva cada 200 ms
+    a.faults.fail_extend.store(1, Ordering::SeqCst); // la primera renovación falla como un corte de red
+    let wa = worker(&f, h.clone(), a);
+    wait_until("`a` tiene el mensaje", 5, || {
+        h.busy.lock().unwrap().contains("a")
+    })
+    .await;
+    let mut b = cfg(2, &[]);
+    b.lease = ms(600);
+    let wb = worker(&f, h.clone(), b);
+    wait_until("ambos procesados", 10, || h.len() == 2).await;
+    tokio::time::sleep(ms(300)).await;
+    assert_eq!(h.seqs("a"), [0, 1]);
+    assert_eq!(
+        h.calls.load(Ordering::SeqCst),
+        2,
+        "tras el fallo pasajero el turno siguió siendo suyo"
+    );
+    assert!(!h.overlap.load(Ordering::SeqCst));
+    stop(vec![wa, wb]).await;
+}
+
+/// Destino que guarda, por grupo, el último número de turno aplicado y rechaza los menores.
+#[derive(Clone, Default)]
+struct Writer {
+    dest: Arc<Mutex<HashMap<String, (u64, u32)>>>,
+    rejected: Arc<Mutex<Vec<(u32, u64)>>>,
+    stall_first: Arc<AtomicBool>,
+    told_lost: Arc<AtomicBool>,
+}
+
+impl Handler for Writer {
+    async fn handle(&self, job: Job) -> Result<(), HandlerError> {
+        let n = u32::from_be_bytes(job.payload.as_slice().try_into().unwrap());
+        if n == 0 && self.stall_first.swap(false, Ordering::SeqCst) {
+            // Se queda pausado hasta perder el turno, y luego escribe igualmente, como un proceso congelado.
+            tokio::select! {
+                () = job.lost.cancelled() => self.told_lost.store(true, Ordering::SeqCst),
+                () = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+            // "Despierta" tarde: cuando el nuevo dueño ya aplicó el último mensaje del grupo.
+            for _ in 0..200 {
+                if self
+                    .dest
+                    .lock()
+                    .unwrap()
+                    .get(&job.group)
+                    .is_some_and(|&(_, n)| n == 1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let mut dest = self.dest.lock().unwrap();
+        if dest
+            .get(&job.group)
+            .is_some_and(|&(fence, _)| job.fence < fence)
+        {
+            self.rejected.lock().unwrap().push((n, job.fence));
+        } else {
+            dest.insert(job.group.clone(), (job.fence, n));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_lost_its_turn_is_told_and_its_late_write_is_fenced() {
+    let f = fila().await;
+    push_n(&f, "a", 2).await;
+    let w = Writer::default();
+    w.stall_first.store(true, Ordering::SeqCst);
+
+    // `a` no consigue renovar (4 fallos seguidos): su turno vence y `b` toma el grupo.
+    // Con intentos de sobra: el turno que `a` pierde cuenta como un intento.
+    let mut ca = cfg(1, &[20, 20]);
+    ca.lease = ms(300);
+    ca.faults.fail_extend.store(4, Ordering::SeqCst);
+    let (ta, ha) = {
+        let (tx, rx) = watch::channel(false);
+        (tx, tokio::spawn(run_worker(f.clone(), w.clone(), ca, rx)))
+    };
+    wait_until("`a` pausado con el mensaje 0", 5, || {
+        !w.stall_first.load(Ordering::SeqCst)
+    })
+    .await;
+    let (tb, hb) = {
+        let (tx, rx) = watch::channel(false);
+        (
+            tx,
+            tokio::spawn(run_worker(f.clone(), w.clone(), cfg(1, &[20, 20]), rx)),
+        )
+    };
+
+    wait_until("`a` supo que perdió el turno", 10, || {
+        w.told_lost.load(Ordering::SeqCst)
+    })
+    .await;
+    for _ in 0..200 {
+        if !w.rejected.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(ms(25)).await;
+    }
+    if w.rejected.lock().unwrap().is_empty() && hb.is_finished() {
+        panic!(
+            "el trabajador B terminó: {:?}",
+            hb.await.unwrap().map_err(|e| e.to_string())
+        );
+    }
+    if w.rejected.lock().unwrap().is_empty() {
+        let base = f.dead_key().replace(":dead", "");
+        let mut c = client().get_multiplexed_async_connection().await.unwrap();
+        let mut q = async |args: &[&str]| -> redis::Value {
+            let mut cmd = redis::cmd(args[0]);
+            for a in &args[1..] {
+                cmd.arg(*a);
+            }
+            cmd.query_async(&mut c).await.unwrap()
+        };
+        let state = format!(
+            "ready={:?} busy={:?} delay={:?} halted={:?} lista={:?}",
+            q(&["LRANGE", &format!("{base}:ready"), "0", "-1"]).await,
+            q(&["ZRANGE", &format!("{base}:busy"), "0", "-1", "WITHSCORES"]).await,
+            q(&["ZRANGE", &format!("{base}:delay"), "0", "-1"]).await,
+            q(&["SMEMBERS", &format!("{base}:halted")]).await,
+            q(&["LLEN", &format!("{base}:g:a")]).await,
+        );
+        panic!(
+            "la escritura tardía no se rechazó: destino={:?} {state}",
+            w.dest.lock().unwrap()
+        );
+    }
+    assert_eq!(
+        w.dest.lock().unwrap()["a"].1,
+        1,
+        "el estado final es el del último mensaje, en orden"
+    );
+    let (n, _) = w.rejected.lock().unwrap()[0];
+    assert_eq!(n, 0, "lo rechazado fue la escritura tardía del mensaje 0");
+    stop(vec![(ta, ha), (tb, hb)]).await;
+}
+
+#[derive(Clone, Default)]
+struct Panicky {
+    panics_left: Arc<AtomicU32>,
+    log: Arc<Mutex<Vec<u32>>>,
+}
+
+impl Handler for Panicky {
+    async fn handle(&self, job: Job) -> Result<(), HandlerError> {
+        let n = u32::from_be_bytes(job.payload.as_slice().try_into().unwrap());
+        if n == 0
+            && self
+                .panics_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+                .is_ok()
+        {
+            panic!("manejador roto a propósito");
+        }
+        self.log.lock().unwrap().push(n);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_handler_is_retried_and_the_worker_survives() {
+    let f = fila().await;
+    push_n(&f, "a", 2).await;
+    let h = Panicky::default();
+    h.panics_left.store(1, Ordering::SeqCst);
+    let (tx, rx) = watch::channel(false);
+    let w = tokio::spawn(run_worker(f.clone(), h.clone(), cfg(1, &[20]), rx));
+    wait_until("ambos procesados tras el pánico", 10, || {
+        h.log.lock().unwrap().len() == 2
+    })
+    .await;
+    assert_eq!(*h.log.lock().unwrap(), [0, 1]);
+    assert!(!w.is_finished(), "el trabajador sigue vivo");
+    stop(vec![(tx, w)]).await;
+}
+
+#[tokio::test]
+async fn a_halted_group_waits_for_redrive_and_keeps_its_order() {
+    let f = fila().await; // por defecto: OnDead::Halt
+    let h = Rec::default();
+    h.fatal.lock().unwrap().insert(("a".into(), 1));
+    push_n(&f, "a", 4).await;
+    push_n(&f, "b", 3).await;
+    let ws = vec![worker(&f, h.clone(), cfg(2, &[]))];
+    wait_until("`b` completo y `a` detenido", 10, || {
+        h.seqs("b").len() == 3 && !h.seqs("a").is_empty()
+    })
+    .await;
+    tokio::time::sleep(ms(300)).await;
+    assert_eq!(h.seqs("a"), [0], "tras el mensaje muerto, `a` no avanza");
+    assert_eq!(f.halted().await.unwrap(), ["a"]);
+
+    h.fatal.lock().unwrap().clear();
+    let (dead_id, _) = dead_entries(&f).await.remove(0);
+    assert!(f.redrive(&dead_id).await.unwrap());
+    wait_until("`a` completo", 10, || h.seqs("a").len() == 4).await;
+    assert_eq!(
+        h.seqs("a"),
+        [0, 1, 2, 3],
+        "el mensaje reinyectado va primero"
+    );
+    assert!(f.halted().await.unwrap().is_empty());
+    assert!(dead(&f).await.is_empty());
+    stop(ws).await;
+}
+
+#[tokio::test]
+async fn release_resumes_a_halted_group_without_its_dead_message() {
+    let f = fila().await;
+    let h = Rec::default();
+    h.fatal.lock().unwrap().insert(("a".into(), 1));
+    push_n(&f, "a", 3).await;
+    let ws = vec![worker(&f, h.clone(), cfg(1, &[]))];
+    for _ in 0..400 {
+        if f.halted().await.unwrap() == ["a"] {
+            break;
+        }
+        tokio::time::sleep(ms(25)).await;
+    }
+    assert_eq!(f.halted().await.unwrap(), ["a"]);
+    assert_eq!(h.seqs("a"), [0]);
+
+    assert!(f.release("a").await.unwrap());
+    wait_until("`a` siguió sin el mensaje muerto", 10, || {
+        h.seqs("a").len() == 2
+    })
+    .await;
+    assert_eq!(h.seqs("a"), [0, 2]);
+    assert_eq!(dead(&f).await.len(), 1, "el mensaje muerto sigue en la DLQ");
+    assert!(f.halted().await.unwrap().is_empty());
+    stop(ws).await;
+}
+
+#[tokio::test]
+async fn take_skips_a_group_in_turn_with_an_empty_queue() {
+    let f = fila().await;
+    let ready = f.dead_key().replace(":dead", ":ready");
+    let mut c = client().get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("RPUSH")
+        .arg(&ready)
+        .arg("fantasma")
+        .query_async::<()>(&mut c)
+        .await
+        .unwrap();
+    push_n(&f, "real", 1).await;
+    let t = f
+        .take(ms(1000))
+        .await
+        .unwrap()
+        .expect("debe saltar el grupo fantasma");
+    assert_eq!(t.group, "real");
+}
+
+#[tokio::test]
+async fn a_halted_group_with_an_empty_queue_does_not_skip_its_dead_message_on_push() {
+    let f = fila().await;
+    let h = Rec::default();
+    h.fatal.lock().unwrap().insert(("c".into(), 0));
+    push_n(&f, "c", 1).await; // su único mensaje morirá: el grupo queda detenido con la fila vacía
+    let ws = vec![worker(&f, h.clone(), cfg(1, &[]))];
+    for _ in 0..400 {
+        if f.halted().await.unwrap() == ["c"] {
+            break;
+        }
+        tokio::time::sleep(ms(25)).await;
+    }
+    assert_eq!(f.halted().await.unwrap(), ["c"]);
+
+    f.push("c", Uuid::now_v7(), &1u32.to_be_bytes())
+        .await
+        .unwrap();
+    tokio::time::sleep(ms(300)).await;
+    assert!(
+        h.seqs("c").is_empty(),
+        "el mensaje nuevo no se aplica sin el que murió"
+    );
+
+    h.fatal.lock().unwrap().clear();
+    let (dead_id, _) = dead_entries(&f).await.remove(0);
+    assert!(f.redrive(&dead_id).await.unwrap());
+    wait_until("`c` completo", 10, || h.seqs("c").len() == 2).await;
+    assert_eq!(h.seqs("c"), [0, 1]);
+    stop(ws).await;
+}
+
+#[derive(Clone, Default)]
+struct Timed {
+    fails_left: Arc<AtomicU32>,
+    at: Arc<Mutex<Vec<std::time::Instant>>>,
+}
+
+impl Handler for Timed {
+    async fn handle(&self, _job: Job) -> Result<(), HandlerError> {
+        self.at.lock().unwrap().push(std::time::Instant::now());
+        if self
+            .fails_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+            .is_ok()
+        {
+            return Err(HandlerError::Retry("todavía no".into()));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_retry_waits_its_delay_before_running_again() {
+    let f = fila().await;
+    push_n(&f, "a", 1).await;
+    let h = Timed::default();
+    h.fails_left.store(2, Ordering::SeqCst);
+    let (tx, rx) = watch::channel(false);
+    let w = tokio::spawn(run_worker(f.clone(), h.clone(), cfg(1, &[300, 600]), rx));
+    wait_until("tres intentos", 10, || h.at.lock().unwrap().len() == 3).await;
+    let at = h.at.lock().unwrap().clone();
+    // Redis mide en milisegundos enteros: un reintento a 300 ms puede llegar a los 299,x ms reales.
+    assert!(
+        at[1] - at[0] >= ms(290),
+        "primer reintento a los {:?}",
+        at[1] - at[0]
+    );
+    assert!(
+        at[2] - at[1] >= ms(590),
+        "segundo reintento a los {:?}",
+        at[2] - at[1]
+    );
+    stop(vec![(tx, w)]).await;
 }
